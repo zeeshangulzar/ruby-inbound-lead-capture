@@ -1,0 +1,77 @@
+require "rails_helper"
+
+RSpec.describe Lead do
+  subject(:lead) do
+    described_class.new(
+      thread_id:    "thread-abc",
+      sender_email: "sam@example.com",
+      status:       Lead::STATUS_IN_CONVERSATION
+    )
+  end
+
+  describe "validations" do
+    it { is_expected.to be_valid }
+
+    it "requires a thread_id" do
+      lead.thread_id = nil
+      expect(lead).not_to be_valid
+    end
+
+    it "requires a sender_email" do
+      lead.sender_email = nil
+      expect(lead).not_to be_valid
+    end
+
+    it "enforces thread_id uniqueness" do
+      lead.save!
+      dup = described_class.new(thread_id: "thread-abc", sender_email: "other@example.com")
+      expect(dup).not_to be_valid
+    end
+
+    it "rejects unknown status values" do
+      lead.status = "gibberish"
+      expect(lead).not_to be_valid
+    end
+  end
+
+  describe "#missing_required_fields" do
+    it "lists every required field when extracted_data is empty" do
+      expect(lead.missing_required_fields).to match_array(Lead::REQUIRED_FIELDS)
+    end
+
+    it "returns only the blank ones" do
+      lead.extracted_data = { "employees" => 42, "hours" => 20 }
+      expect(lead.missing_required_fields).to match_array(%w[budget_eur website])
+    end
+  end
+
+  describe "#ready_for_final_verdict?" do
+    it "is true when all required fields are present" do
+      lead.extracted_data = { "employees" => 40, "budget_eur" => 5000, "hours" => 40, "website" => "https://acme.co" }
+      expect(lead).to be_ready_for_final_verdict
+    end
+
+    it "is true after the reply cap is hit" do
+      lead.ai_reply_count = Lead::MAX_AI_REPLIES
+      expect(lead).to be_ready_for_final_verdict
+    end
+
+    it "is false when data is missing and cap is not reached" do
+      lead.ai_reply_count = 1
+      expect(lead).not_to be_ready_for_final_verdict
+    end
+  end
+
+  describe "#tier / #score" do
+    it "returns nil when verdict is absent" do
+      expect(lead.tier).to be_nil
+      expect(lead.score).to be_nil
+    end
+
+    it "reads from the verdict hash when present" do
+      lead.verdict = { "tier" => "warm", "score" => 72 }
+      expect(lead.tier).to eq("warm")
+      expect(lead.score).to eq(72)
+    end
+  end
+end
