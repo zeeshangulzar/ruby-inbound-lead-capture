@@ -2,7 +2,7 @@ source "https://rubygems.org"
 
 ruby "3.3.6"
 
-gem "rails", "~> 7.2.3", ">= 7.2.3.1"
+gem "rails", "~> 8.1.3"
 gem "sprockets-rails"
 gem "sqlite3", ">= 1.4"
 gem "puma", ">= 5.0"
