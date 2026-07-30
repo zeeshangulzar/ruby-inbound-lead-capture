@@ -28,13 +28,15 @@ class HubspotSync
     first, last = split_name(@lead.sender_name)
 
     {
-      email:       @lead.sender_email,
-      firstname:   first,
-      lastname:    last,
-      company:     data["company"],
-      website:     data["website"],
-      numemployees: data["employees"],
-      hs_lead_status: "NEW"
+      email:            @lead.sender_email,
+      firstname:        first,
+      lastname:         last,
+      company:          data["company"],
+      website:          data["website"],
+      # HubSpot's built-in employee-count property is `numberofemployees`;
+      # an unknown property name makes the whole create fail with a 400.
+      numberofemployees: data["employees"],
+      hs_lead_status:   "NEW"
     }.compact
   end
 

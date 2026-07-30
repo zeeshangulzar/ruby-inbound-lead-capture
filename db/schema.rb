@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[7.2].define(version: 2026_07_26_100000) do
+ActiveRecord::Schema[7.2].define(version: 2026_07_30_120000) do
   create_table "leads", force: :cascade do |t|
     t.string "thread_id", null: false
     t.string "sender_email", null: false
@@ -23,6 +23,9 @@ ActiveRecord::Schema[7.2].define(version: 2026_07_26_100000) do
     t.string "hubspot_contact_id"
     t.datetime "created_at", null: false
     t.datetime "updated_at", null: false
+    t.integer "inbox_id"
+    t.string "last_message_id"
+    t.index ["last_message_id"], name: "index_leads_on_last_message_id"
     t.index ["sender_email"], name: "index_leads_on_sender_email"
     t.index ["status"], name: "index_leads_on_status"
     t.index ["thread_id"], name: "index_leads_on_thread_id", unique: true

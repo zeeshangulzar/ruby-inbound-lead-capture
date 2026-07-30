@@ -62,6 +62,39 @@ RSpec.describe Lead do
     end
   end
 
+  describe "#already_processed?" do
+    it "is false before any message has been recorded" do
+      expect(lead).not_to be_already_processed("msg-1")
+    end
+
+    it "is true for the message just processed" do
+      lead.last_message_id = "msg-1"
+      expect(lead).to be_already_processed("msg-1")
+    end
+
+    it "is false for a new message on the same thread" do
+      lead.last_message_id = "msg-1"
+      expect(lead).not_to be_already_processed("msg-2")
+    end
+
+    it "compares as strings, since ids arrive from JSON" do
+      lead.last_message_id = "12345"
+      expect(lead).to be_already_processed(12_345)
+    end
+  end
+
+  describe "#reply_cap_reached?" do
+    it "is false below the cap" do
+      lead.ai_reply_count = Lead::MAX_AI_REPLIES - 1
+      expect(lead).not_to be_reply_cap_reached
+    end
+
+    it "is true at the cap" do
+      lead.ai_reply_count = Lead::MAX_AI_REPLIES
+      expect(lead).to be_reply_cap_reached
+    end
+  end
+
   describe "#tier / #score" do
     it "returns nil when verdict is absent" do
       expect(lead.tier).to be_nil

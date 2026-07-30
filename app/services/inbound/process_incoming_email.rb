@@ -1,19 +1,32 @@
 module Inbound
-  # Orchestrates the full processing pipeline for a single verified inbound
-  # email. Kept lean: each step is a small collaborator.
+  # Orchestrates the full processing pipeline for a single inbound message that
+  # has already been fetched off the API and normalized. Kept lean: each step is
+  # a small collaborator.
   class ProcessIncomingEmail
-    def initialize(payload)
-      @payload = payload
+    def initialize(normalized)
+      @normalized = normalized
     end
 
     def call
-      normalized = PayloadNormalizer.new(@payload).call
-      lead       = find_or_create_lead(normalized)
+      lead = find_or_create_lead
+
+      # Redelivery of a message we already handled: do nothing, rather than
+      # call the AI again and send the prospect a second reply.
+      if lead.already_processed?(@normalized.message_id)
+        Rails.logger.info("[ProcessIncomingEmail] duplicate delivery of #{@normalized.message_id} — skipped")
+        return
+      end
+
+      lead.update!(
+        inbox_id:        @normalized.inbox_id,
+        last_message_id: @normalized.message_id,
+        last_subject:    @normalized.subject.presence || lead.last_subject
+      )
 
       return if lead.status == Lead::STATUS_FINALIZED
       return if lead.status == Lead::STATUS_RED_FLAGGED
 
-      qualification = LeadQualifier.new(lead: lead, incoming_body: normalized.body_text).call
+      qualification = LeadQualifier.new(lead: lead, incoming_body: @normalized.body_text).call
 
       merged_data = lead.extracted_data.merge(qualification.extracted_data.compact)
       lead.update!(extracted_data: merged_data)
@@ -33,13 +46,12 @@ module Inbound
 
     private
 
-    def find_or_create_lead(normalized)
-      Lead.find_or_create_by!(thread_id: normalized.thread_id) do |lead|
-        lead.sender_email = normalized.sender_email
-        lead.sender_name  = normalized.sender_name
-        lead.last_subject = normalized.subject
-      end.tap do |lead|
-        lead.update!(last_subject: normalized.subject) if normalized.subject.present?
+    def find_or_create_lead
+      Lead.find_or_create_by!(thread_id: @normalized.thread_id) do |lead|
+        lead.sender_email = @normalized.sender_email
+        lead.sender_name  = @normalized.sender_name
+        lead.last_subject = @normalized.subject
+        lead.inbox_id     = @normalized.inbox_id
       end
     end
 

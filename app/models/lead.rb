@@ -16,6 +16,12 @@ class Lead < ApplicationRecord
   validates :sender_email, presence: true
   validates :status,       inclusion: { in: [STATUS_IN_CONVERSATION, STATUS_FINALIZED, STATUS_RED_FLAGGED] }
 
+  # Mailtrap redelivers a webhook until it gets a 2xx, so the same message can
+  # arrive several times. Anything already processed must not be run again.
+  def already_processed?(message_id)
+    last_message_id.present? && last_message_id == message_id.to_s
+  end
+
   def missing_required_fields
     REQUIRED_FIELDS.reject { |field| extracted_data[field].present? }
   end

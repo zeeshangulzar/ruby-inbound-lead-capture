@@ -1,21 +1,25 @@
-# Sends Melissa's outbound replies via the Mailtrap Email Sending API.
-# Every reply carries the threading headers (In-Reply-To, References, X-Thread-Id)
-# so the exchange appears as one conversation in the prospect's mailbox and in
-# the Mailtrap dashboard.
+# Sends Melissa's replies through the Mailtrap Inbound reply endpoint.
+#
+# Replying on the original message — rather than composing a fresh send —
+# means Mailtrap sets In-Reply-To / References itself, so the exchange stays
+# one conversation both in the prospect's mailbox and in the Mailtrap
+# dashboard. There is no need to track threading headers by hand.
+#
+# @see https://docs.mailtrap.io/developers/inbound/messages
 class MelissaMailer
-  def initialize(lead:, ai_content:)
+  def initialize(lead:, ai_content:, api_client: nil)
     @lead       = lead
     @ai_content = ai_content
+    @api_client = api_client
   end
 
   def send_follow_up
-    subject = @ai_content.reply_subject.presence || "Re: #{@lead.last_subject}"
-    send_mail(subject: subject, text: @ai_content.reply_text, html: @ai_content.reply_html)
+    Rails.logger.info("[MelissaMailer] follow-up on thread #{@lead.thread_id}")
+    deliver(text: @ai_content.reply_text, html: @ai_content.reply_html)
   end
 
   def send_qualified(scheduling_link:)
-    subject = "Re: #{@lead.last_subject.presence || 'your enquiry'}"
-    text    = <<~TEXT
+    text = <<~TEXT
       Thanks — your enquiry looks like a great fit for us.
 
       Grab a slot on my calendar and we'll take it from there:
@@ -30,12 +34,11 @@ class MelissaMailer
       <p>Melissa</p>
     HTML
 
-    send_mail(subject: subject, text: text, html: html)
+    deliver(text: text, html: html)
   end
 
   def send_forwarded(partner_email:)
-    subject = "Re: #{@lead.last_subject.presence || 'your enquiry'}"
-    text    = <<~TEXT
+    text = <<~TEXT
       Thanks for the note. Based on what you've shared, my colleagues at
       #{partner_email} are a better fit — I've put them in copy so they can
       pick things up from here.
@@ -49,33 +52,41 @@ class MelissaMailer
       <p>Melissa</p>
     HTML
 
-    send_mail(subject: subject, text: text, html: html, cc: [partner_email])
+    deliver(text: text, html: html, cc: [partner_email])
   end
 
   private
 
-  def send_mail(subject:, text:, html:, cc: [])
-    mail = Mailtrap::Mail::Base.new(
-      from:    { email: ENV.fetch("MELISSA_EMAIL", "melissa@example.com"), name: "Melissa" },
-      to:      [{ email: @lead.sender_email, name: @lead.sender_name.presence || @lead.sender_email }],
-      cc:      cc.map { |addr| { email: addr } },
-      subject: subject,
-      text:    text,
-      html:    html,
-      headers: threading_headers,
-      category: "inbound-lead"
-    )
+  def deliver(text:, html:, cc: [])
+    unless repliable?
+      Rails.logger.error("[MelissaMailer] cannot reply to lead #{@lead.id}: missing inbox_id / last_message_id")
+      return
+    end
 
-    Mailtrap::Client.new(api_key: ENV.fetch("MAILTRAP_API_TOKEN")).send(mail)
-  rescue => e
-    Rails.logger.error("[MelissaMailer] send failed for thread #{@lead.thread_id}: #{e.class} — #{e.message}")
+    api_client.reply(
+      inbox_id:   @lead.inbox_id,
+      message_id: @lead.last_message_id,
+      text:       text,
+      html:       html,
+      cc:         cc,
+      from:       sender_address,
+      category:   "inbound-lead"
+    )
+  rescue StandardError => e
+    Rails.logger.error("[MelissaMailer] reply failed for thread #{@lead.thread_id}: #{e.class} — #{e.message}")
   end
 
-  def threading_headers
-    {
-      "In-Reply-To" => @lead.thread_id,
-      "References"  => @lead.thread_id,
-      "X-Thread-Id" => @lead.thread_id
-    }
+  def repliable?
+    @lead.inbox_id.present? && @lead.last_message_id.present?
+  end
+
+  # Mailtrap-hosted inboxes always send from their own address and reject an
+  # explicit `from`. Only set it when a custom-domain sender is configured.
+  def sender_address
+    ENV["MELISSA_EMAIL"].presence
+  end
+
+  def api_client
+    @api_client ||= Inbound::ApiClient.new
   end
 end

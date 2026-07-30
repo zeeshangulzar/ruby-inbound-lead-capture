@@ -30,8 +30,17 @@ class WebsiteAnalyzer
 
   private
 
+  # A bare domain ("acme.co") parses to a URI with no host, and HTTParty then
+  # tries to connect to nil:80. Prospects and the AI both supply these, so
+  # default the scheme rather than red-flagging a legitimate lead.
+  def normalized_url
+    return @url if @url.match?(%r{\A[a-z][a-z0-9+.-]*://}i)
+
+    "https://#{@url}"
+  end
+
   def fetch_and_parse
-    response = HTTParty.get(@url, timeout: FETCH_TIMEOUT_SECONDS, follow_redirects: true)
+    response = HTTParty.get(normalized_url, timeout: FETCH_TIMEOUT_SECONDS, follow_redirects: true)
     return fetch_error_result(response.code) unless response.success?
 
     doc = Nokogiri::HTML(response.body)
@@ -51,7 +60,7 @@ class WebsiteAnalyzer
       max_tokens: 256,
       system:     "You judge whether a company website looks legitimate. Return only JSON: { \"legitimate\": <boolean>, \"reasoning\": <string> }.",
       messages:   [{ role: "user", content: <<~PROMPT }]
-        URL:          #{@url}
+        URL:          #{normalized_url}
         Title:        #{snapshot[:title]}
         Description:  #{snapshot[:description]}
         Body sample:  #{snapshot[:body]}
@@ -60,14 +69,23 @@ class WebsiteAnalyzer
         contact details, parked domains, or obvious scams as not legitimate.
       PROMPT
     )
-    parsed = JSON.parse(response.content.first.text[/\{.*\}/m])
+    # A response with no JSON object at all would make JSON.parse raise
+    # TypeError on nil, which the rescue below would miss.
+    json_slice = response.content.first.text.to_s[/\{.*\}/m]
+    return unparseable_verdict_result("no JSON object in response") if json_slice.nil?
+
+    parsed = JSON.parse(json_slice)
     Result.new(
       legitimate:  parsed["legitimate"] == true,
       reasoning:   parsed["reasoning"].to_s,
       fetch_error: false
     )
   rescue JSON::ParserError => e
-    Rails.logger.error("[WebsiteAnalyzer] Claude returned unparseable JSON: #{e.message}")
+    unparseable_verdict_result(e.message)
+  end
+
+  def unparseable_verdict_result(detail)
+    Rails.logger.error("[WebsiteAnalyzer] Claude returned unparseable JSON: #{detail}")
     Result.new(legitimate: false, reasoning: "Verdict parse error.", fetch_error: false)
   end
 
