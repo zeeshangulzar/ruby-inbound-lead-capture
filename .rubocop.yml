@@ -1,0 +1,9 @@
+# Omakase Ruby styling for Rails
+inherit_gem: { rubocop-rails-omakase: rubocop.yml }
+
+# Overwrite or add rules to create your own house style
+
+# Use `[a, [b, c]]` not `[ a, [ b, c ] ]` — matches the style used across the
+# other Mailtrap Ruby example apps.
+Layout/SpaceInsideArrayLiteralBrackets:
+  Enabled: false

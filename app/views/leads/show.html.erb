@@ -1,0 +1,118 @@
+<% content_for :title, "Lead ##{@lead.id} — Inbound Lead Capture" %>
+
+<div class="page">
+  <div class="crumbs"><%= link_to "← All leads", leads_path %></div>
+
+  <header>
+    <h1>
+      <%= @lead.sender_name.presence || @lead.sender_email %>
+      <% if @lead.tier %>
+        <span class="tier tier-<%= @lead.tier %>"><%= @lead.tier %></span>
+      <% end %>
+    </h1>
+    <p class="lead">
+      <%= @lead.sender_email %> · thread <code><%= @lead.thread_id %></code>
+    </p>
+  </header>
+
+  <div class="grid">
+    <section class="card">
+      <h2>Extracted data</h2>
+      <dl>
+        <% Lead::REQUIRED_FIELDS.each do |field| %>
+          <dt><%= field.humanize %></dt>
+          <dd class="<%= 'missing' if @lead.extracted_data[field].blank? %>">
+            <%= @lead.extracted_data[field].presence || "—" %>
+          </dd>
+        <% end %>
+        <dt>Company</dt>
+        <dd><%= @lead.extracted_data["company"].presence || "—" %></dd>
+        <% if @lead.extracted_data["budget_currency"].present? %>
+          <dt>Budget currency</dt>
+          <dd><%= @lead.extracted_data["budget_currency"] %></dd>
+        <% end %>
+      </dl>
+    </section>
+
+    <section class="card">
+      <h2>Verdict</h2>
+      <% if @lead.verdict.present? %>
+        <dl>
+          <dt>Tier</dt>
+          <dd><span class="tier tier-<%= @lead.tier %>"><%= @lead.tier %></span></dd>
+
+          <dt>Score</dt>
+          <dd><%= @lead.score %> / 100</dd>
+
+          <dt>Data completeness</dt>
+          <dd><%= @lead.verdict["data_completeness"] %></dd>
+
+          <dt>Reasoning</dt>
+          <dd class="reasoning"><%= @lead.verdict["reasoning"] %></dd>
+
+          <% next_steps = Array(@lead.verdict["next_steps"]) %>
+          <% if next_steps.any? %>
+            <dt>Next steps</dt>
+            <dd>
+              <ul>
+                <% next_steps.each do |step| %>
+                  <li><%= step %></li>
+                <% end %>
+              </ul>
+            </dd>
+          <% end %>
+        </dl>
+      <% else %>
+        <p class="dim">Not yet finalized. AI replies sent: <%= @lead.ai_reply_count %> of <%= Lead::MAX_AI_REPLIES %>.</p>
+      <% end %>
+    </section>
+
+    <section class="card">
+      <h2>Meta</h2>
+      <dl>
+        <dt>Status</dt>
+        <dd><%= @lead.status.humanize %></dd>
+
+        <dt>AI replies sent</dt>
+        <dd><%= @lead.ai_reply_count %> / <%= Lead::MAX_AI_REPLIES %></dd>
+
+        <dt>HubSpot contact</dt>
+        <dd><%= @lead.hubspot_contact_id.presence || "—" %></dd>
+
+        <dt>Received</dt>
+        <dd><%= @lead.created_at.strftime("%Y-%m-%d %H:%M") %></dd>
+
+        <dt>Updated</dt>
+        <dd><%= @lead.updated_at.strftime("%Y-%m-%d %H:%M") %></dd>
+      </dl>
+    </section>
+  </div>
+</div>
+
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; background: #f6f6f6; margin: 0; padding: 32px 24px; color: #222; }
+  .page { max-width: 1080px; margin: 0 auto; }
+  .crumbs { margin-bottom: 12px; }
+  h1 { margin: 0 0 4px 0; display: flex; align-items: center; gap: 12px; }
+  .lead { color: #666; margin: 0 0 24px 0; }
+  code { background: #eee; padding: 1px 6px; border-radius: 3px; font-size: 13px; }
+  .grid { display: grid; gap: 16px; grid-template-columns: 1fr 1fr; }
+  @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: #fff; padding: 20px 24px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,.05); }
+  .card h2 { margin: 0 0 12px 0; font-size: 16px; }
+  dl { margin: 0; display: grid; grid-template-columns: 140px 1fr; row-gap: 8px; column-gap: 12px; font-size: 14px; }
+  dt { color: #666; font-weight: 500; }
+  dd { margin: 0; }
+  dd.missing { color: #b91c1c; font-style: italic; }
+  .reasoning { white-space: pre-wrap; }
+  .tier { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; text-transform: uppercase; }
+  .tier-hot       { background: #fee2e2; color: #b91c1c; }
+  .tier-warm      { background: #fef3c7; color: #92400e; }
+  .tier-cold      { background: #dbeafe; color: #1e40af; }
+  .tier-forwarded { background: #e5e7eb; color: #374151; }
+  .tier-red_flag  { background: #111; color: #fff; }
+  .dim { color: #888; }
+  a { color: #635bff; text-decoration: none; font-weight: 600; }
+  a:hover { text-decoration: underline; }
+  ul { margin: 0; padding-left: 20px; }
+</style>
