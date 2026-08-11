@@ -6,7 +6,7 @@ require "json"
 # so signups never break because of AI availability.
 class LeadQualifier
   Result = Struct.new(
-    :extracted_data, :reply_subject, :reply_text, :reply_html,
+    :extracted_data, :reply_subject, :reply_paragraphs,
     :hostile, :off_topic, :reasoning, :fallback,
     keyword_init: true
   ) do
@@ -38,9 +38,9 @@ class LeadQualifier
       * If the lead claims something implausible (e.g. "500 employees" but their website
         is a one-page brochure), note the inconsistency in "reasoning".
       * Ask for ALL missing fields in a single reply. Never drip-feed one question.
-      * Sign every reply as "Melissa". 3-5 sentences. Friendly-professional. No emojis.
-        Plain text + simple HTML.
-      * English only.
+      * Reply body is an array of 2-4 short plain-text paragraphs. No HTML, no markdown,
+        no signature — the signoff is added by the application. Friendly-professional,
+        no emojis. English only.
 
     Return valid JSON matching this exact schema:
     {
@@ -53,8 +53,7 @@ class LeadQualifier
         "hours": <number|null>
       },
       "reply_subject": <string>,
-      "reply_text": <string>,
-      "reply_html": <string>,
+      "reply_paragraphs": [<string>, ...],
       "hostile": <boolean>,
       "off_topic": <boolean>,
       "reasoning": <string>
@@ -107,14 +106,13 @@ class LeadQualifier
     parsed     = JSON.parse(json_slice)
 
     Result.new(
-      extracted_data: (parsed["extracted_data"] || {}).slice(*allowed_extracted_keys),
-      reply_subject:  parsed["reply_subject"].to_s,
-      reply_text:     parsed["reply_text"].to_s,
-      reply_html:     parsed["reply_html"].to_s,
-      hostile:        parsed["hostile"] == true,
-      off_topic:      parsed["off_topic"] == true,
-      reasoning:      parsed["reasoning"].to_s,
-      fallback:       false
+      extracted_data:   (parsed["extracted_data"] || {}).slice(*allowed_extracted_keys),
+      reply_subject:    parsed["reply_subject"].to_s,
+      reply_paragraphs: sanitize_paragraphs(parsed["reply_paragraphs"]),
+      hostile:          parsed["hostile"] == true,
+      off_topic:        parsed["off_topic"] == true,
+      reasoning:        parsed["reasoning"].to_s,
+      fallback:         false
     )
   rescue JSON::ParserError
     fallback_result
@@ -124,16 +122,25 @@ class LeadQualifier
     %w[company website employees budget_eur budget_currency hours]
   end
 
+  # Strip any HTML the model included despite the instructions — the templates
+  # do the escaping and formatting, and letting raw markup through would defeat
+  # that. Also drops empty paragraphs and caps to a sensible upper bound.
+  def sanitize_paragraphs(value)
+    Array(value)
+      .map { |p| ActionController::Base.helpers.strip_tags(p.to_s).squish }
+      .reject(&:empty?)
+      .first(6)
+  end
+
   def fallback_result
     Result.new(
-      extracted_data: {},
-      reply_subject:  "Re: #{@lead.last_subject.presence || 'your enquiry'}",
-      reply_text:     "Thanks for reaching out — we'll get back to you shortly.\n\nMelissa",
-      reply_html:     "<p>Thanks for reaching out — we'll get back to you shortly.</p><p>Melissa</p>",
-      hostile:        false,
-      off_topic:      false,
-      reasoning:      "Anthropic API unavailable — generic acknowledgement sent.",
-      fallback:       true
+      extracted_data:   {},
+      reply_subject:    "Re: #{@lead.last_subject.presence || 'your enquiry'}",
+      reply_paragraphs: ["Thanks for reaching out — we'll get back to you shortly."],
+      hostile:          false,
+      off_topic:        false,
+      reasoning:        "Anthropic API unavailable — generic acknowledgement sent.",
+      fallback:         true
     )
   end
 end

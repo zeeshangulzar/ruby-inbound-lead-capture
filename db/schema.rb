@@ -10,7 +10,22 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[7.2].define(version: 2026_07_30_120000) do
+ActiveRecord::Schema[7.2].define(version: 2026_08_11_120100) do
+  create_table "inbound_events", force: :cascade do |t|
+    t.string "event_id", null: false
+    t.string "message_id", null: false
+    t.integer "inbox_id"
+    t.string "status", default: "queued", null: false
+    t.json "payload"
+    t.datetime "processed_at"
+    t.text "last_error"
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.index ["event_id"], name: "index_inbound_events_on_event_id", unique: true
+    t.index ["message_id"], name: "index_inbound_events_on_message_id", unique: true
+    t.index ["status"], name: "index_inbound_events_on_status"
+  end
+
   create_table "leads", force: :cascade do |t|
     t.string "thread_id", null: false
     t.string "sender_email", null: false
@@ -25,6 +40,8 @@ ActiveRecord::Schema[7.2].define(version: 2026_07_30_120000) do
     t.datetime "updated_at", null: false
     t.integer "inbox_id"
     t.string "last_message_id"
+    t.string "last_reply_status"
+    t.text "last_reply_error"
     t.index ["last_message_id"], name: "index_leads_on_last_message_id"
     t.index ["sender_email"], name: "index_leads_on_sender_email"
     t.index ["status"], name: "index_leads_on_status"

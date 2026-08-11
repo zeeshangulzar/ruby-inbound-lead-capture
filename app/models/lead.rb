@@ -9,6 +9,10 @@ class Lead < ApplicationRecord
   TIER_WARM      = "warm".freeze
   TIER_COLD      = "cold".freeze
 
+  REPLY_STATUS_PENDING = "pending".freeze
+  REPLY_STATUS_SENT    = "sent".freeze
+  REPLY_STATUS_FAILED  = "failed".freeze
+
   REQUIRED_FIELDS  = %w[employees budget_eur hours website].freeze
   MAX_AI_REPLIES   = 5
 

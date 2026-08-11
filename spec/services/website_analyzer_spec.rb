@@ -1,118 +1,110 @@
 require "rails_helper"
 
 RSpec.describe WebsiteAnalyzer do
-  before { set_env("ANTHROPIC_API_KEY" => "test-key") }
+  def stub_fetcher(response)
+    fetcher = instance_double(Inbound::SafeHttpFetcher, call: response)
+    allow(Inbound::SafeHttpFetcher).to receive(:new).and_return(fetcher)
+    fetcher
+  end
 
-  def stub_page(body: "<html><head><title>Acme</title></head><body>Real business</body></html>", success: true, code: 200)
-    allow(HTTParty).to receive(:get).and_return(
-      instance_double(HTTParty::Response, success?: success, code: code, body: body)
+  def http_response(body: "<html><head><title>Acme</title></head><body>Real business</body></html>", status: 200)
+    Inbound::SafeHttpFetcher::Response.new(
+      body:      body,
+      status:    status,
+      headers:   {},
+      final_url: "https://acme.co"
     )
   end
 
-  def stub_verdict(text)
-    block    = instance_double(Anthropic::Models::TextBlock, text: text)
-    response = instance_double(Anthropic::Models::Message, content: [block])
-    allow(Anthropic::Client).to receive(:new).and_return(double(messages: double(create: response)))
-  end
-
   describe "URL handling" do
-    it "treats a blank website as not legitimate without any network call" do
-      expect(HTTParty).not_to receive(:get)
-      result = described_class.new("").call
+    it "treats a blank website as a no-fetch snapshot" do
+      expect(Inbound::SafeHttpFetcher).not_to receive(:new)
+      snapshot = described_class.new("").call
 
-      expect(result).not_to be_legitimate
-      expect(result.reasoning).to eq("No website supplied.")
+      expect(snapshot.fetched?).to be(false)
+      expect(snapshot.fetch_error).to eq("No website supplied.")
     end
 
-    it "is also safe for nil" do
-      expect(described_class.new(nil).call).not_to be_legitimate
+    it "is safe for nil" do
+      expect(described_class.new(nil).call.fetched?).to be(false)
     end
 
-    # A bare domain parses to a URI with no host, so HTTParty would try to
-    # connect to nil:80 and every such lead would be red-flagged.
     it "adds https:// to a bare domain" do
-      stub_verdict({ legitimate: true, reasoning: "Looks real." }.to_json)
-      expect(HTTParty).to receive(:get).with("https://acme.co", any_args).and_return(
-        instance_double(HTTParty::Response, success?: true, code: 200, body: "<html><body>hi</body></html>")
-      )
-
+      stub_fetcher(http_response)
+      expect(Inbound::SafeHttpFetcher).to receive(:new).with("https://acme.co").and_call_original
       described_class.new("acme.co").call
     end
 
     it "leaves an explicit scheme alone" do
-      stub_verdict({ legitimate: true, reasoning: "Looks real." }.to_json)
-      expect(HTTParty).to receive(:get).with("http://acme.co", any_args).and_return(
-        instance_double(HTTParty::Response, success?: true, code: 200, body: "<html><body>hi</body></html>")
-      )
-
+      stub_fetcher(http_response)
+      expect(Inbound::SafeHttpFetcher).to receive(:new).with("http://acme.co").and_call_original
       described_class.new("http://acme.co").call
     end
   end
 
   describe "a reachable site" do
-    before { stub_page }
+    before { stub_fetcher(http_response) }
 
-    it "returns Claude's positive verdict" do
-      stub_verdict({ legitimate: true, reasoning: "Established consultancy." }.to_json)
-      result = described_class.new("https://acme.co").call
+    it "returns a snapshot with title, description, and body" do
+      snapshot = described_class.new("https://acme.co").call
 
-      expect(result).to be_legitimate
-      expect(result.reasoning).to eq("Established consultancy.")
-      expect(result.fetch_error).to be(false)
+      expect(snapshot.fetched?).to be(true)
+      expect(snapshot.title).to eq("Acme")
+      expect(snapshot.body).to include("Real business")
+      expect(snapshot.fetch_error).to be_nil
     end
 
-    it "returns Claude's negative verdict" do
-      stub_verdict({ legitimate: false, reasoning: "Parked domain." }.to_json)
-      expect(described_class.new("https://acme.co").call).not_to be_legitimate
-    end
-
-    it "does not treat a missing legitimate flag as legitimate" do
-      stub_verdict({ reasoning: "Unclear." }.to_json)
-      expect(described_class.new("https://acme.co").call).not_to be_legitimate
+    it "reads the meta description when present" do
+      stub_fetcher(http_response(
+        body: %(<html><head><meta name="description" content="Consulting for enterprises"></head><body>hi</body></html>)
+      ))
+      expect(described_class.new("https://acme.co").call.description).to eq("Consulting for enterprises")
     end
   end
 
-  describe "failures all resolve to not legitimate" do
+  describe "failures resolve to a snapshot with a fetch_error" do
     it "handles an HTTP error status" do
-      stub_page(success: false, code: 500)
-      result = described_class.new("https://acme.co").call
+      stub_fetcher(http_response(status: 500))
+      snapshot = described_class.new("https://acme.co").call
 
-      expect(result).not_to be_legitimate
-      expect(result.fetch_error).to be(true)
-      expect(result.reasoning).to include("500")
+      expect(snapshot.fetched?).to be(false)
+      expect(snapshot.fetch_error).to include("500")
     end
 
-    it "handles a refused connection" do
-      allow(HTTParty).to receive(:get).and_raise(Errno::ECONNREFUSED)
-      expect(described_class.new("https://acme.co").call.fetch_error).to be(true)
+    it "handles an SSRF block from the fetcher" do
+      allow(Inbound::SafeHttpFetcher).to receive(:new).and_return(
+        instance_double(Inbound::SafeHttpFetcher).tap do |dbl|
+          allow(dbl).to receive(:call).and_raise(Inbound::SafeHttpFetcher::BlockedError, "127.0.0.1 blocked")
+        end
+      )
+
+      snapshot = described_class.new("http://localhost/").call
+      expect(snapshot.fetched?).to be(false)
+      expect(snapshot.fetch_error).to include("BlockedError")
+      expect(snapshot.fetch_error).to include("blocked")
     end
 
-    it "handles a read timeout" do
-      allow(HTTParty).to receive(:get).and_raise(Net::ReadTimeout)
-      expect(described_class.new("https://acme.co").call.fetch_error).to be(true)
+    it "handles a fetcher redirect-loop error" do
+      allow(Inbound::SafeHttpFetcher).to receive(:new).and_return(
+        instance_double(Inbound::SafeHttpFetcher).tap do |dbl|
+          allow(dbl).to receive(:call).and_raise(Inbound::SafeHttpFetcher::TooManyRedirectsError, "3 redirects")
+        end
+      )
+
+      snapshot = described_class.new("https://redirects.example").call
+      expect(snapshot.fetch_error).to include("TooManyRedirectsError")
     end
 
-    it "handles a TLS failure" do
-      allow(HTTParty).to receive(:get).and_raise(OpenSSL::SSL::SSLError, "bad cert")
-      result = described_class.new("https://acme.co").call
+    it "handles a generic error without crashing" do
+      allow(Inbound::SafeHttpFetcher).to receive(:new).and_return(
+        instance_double(Inbound::SafeHttpFetcher).tap do |dbl|
+          allow(dbl).to receive(:call).and_raise(SocketError, "getaddrinfo")
+        end
+      )
 
-      expect(result).not_to be_legitimate
-      expect(result.reasoning).to include("SSLError")
-    end
-
-    it "handles unparseable JSON from Claude" do
-      stub_page
-      stub_verdict("I think it looks fine, honestly")
-      result = described_class.new("https://acme.co").call
-
-      expect(result).not_to be_legitimate
-      expect(result.reasoning).to eq("Verdict parse error.")
-    end
-
-    it "handles a response with no JSON object at all" do
-      stub_page
-      stub_verdict("")
-      expect(described_class.new("https://acme.co").call.reasoning).to eq("Verdict parse error.")
+      snapshot = described_class.new("https://acme.co").call
+      expect(snapshot.fetched?).to be(false)
+      expect(snapshot.fetch_error).to include("SocketError")
     end
   end
 end

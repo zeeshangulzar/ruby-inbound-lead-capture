@@ -15,12 +15,11 @@ RSpec.describe LeadQualifier do
         company: "Acme", website: "https://acme.co", employees: 40,
         budget_eur: 5000, budget_currency: "EUR", hours: 40
       },
-      reply_subject: "Re: your enquiry",
-      reply_text:    "Thanks Sam.\n\nMelissa",
-      reply_html:    "<p>Thanks Sam.</p>",
-      hostile:       false,
-      off_topic:     false,
-      reasoning:     "All fields supplied."
+      reply_subject:    "Re: your enquiry",
+      reply_paragraphs: ["Thanks Sam.", "Can you share your requested engagement hours?"],
+      hostile:          false,
+      off_topic:        false,
+      reasoning:        "All fields supplied."
     }.to_json
   end
 
@@ -43,10 +42,9 @@ RSpec.describe LeadQualifier do
       )
     end
 
-    it "returns Melissa's reply" do
+    it "returns Melissa's reply as paragraphs" do
       expect(result.reply_subject).to eq("Re: your enquiry")
-      expect(result.reply_text).to include("Melissa")
-      expect(result.reply_html).to include("<p>")
+      expect(result.reply_paragraphs).to include("Thanks Sam.")
     end
 
     it "is not a fallback" do
@@ -57,15 +55,20 @@ RSpec.describe LeadQualifier do
       stub_claude({ extracted_data: { company: "Acme", injected: "evil" } }.to_json)
       expect(result.extracted_data.keys).to all(be_in(%w[company website employees budget_eur budget_currency hours]))
     end
+
+    it "strips any HTML the LLM tried to include in a paragraph" do
+      stub_claude({ reply_paragraphs: ["<script>alert(1)</script>", "Real text."] }.to_json)
+      expect(result.reply_paragraphs).to eq(["alert(1)", "Real text."])
+    end
   end
 
   it "flags hostile email" do
-    stub_claude({ hostile: true, reasoning: "Abusive." }.to_json)
+    stub_claude({ hostile: true, reasoning: "Abusive.", reply_paragraphs: [] }.to_json)
     expect(result).to be_hostile
   end
 
   it "flags off-topic email" do
-    stub_claude({ off_topic: true }.to_json)
+    stub_claude({ off_topic: true, reply_paragraphs: ["Here is what we do."] }.to_json)
     expect(result).to be_off_topic
   end
 
@@ -80,7 +83,7 @@ RSpec.describe LeadQualifier do
 
       expect(result).to be_fallback
       expect(result.extracted_data).to eq({})
-      expect(result.reply_text).to include("get back to you")
+      expect(result.reply_paragraphs.join).to include("get back to you")
       expect(result).not_to be_hostile
     end
 

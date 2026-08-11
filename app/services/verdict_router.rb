@@ -1,30 +1,39 @@
 # Runs the final verdict flow once a lead is ready:
-#   - Analyzes the website
-#   - Applies the three-branch routing rules (red_flag / forwarded / qualified)
-#   - Sends the appropriate reply
-#   - Optionally pushes qualified leads to HubSpot
+#   - Fetches the website snapshot (SSRF-hardened).
+#   - Runs FinalVerdict with the merged context (extracted data + snapshot +
+#     earlier reasoning).
+#   - Applies the three-branch routing rules (red_flag / forwarded / qualified).
+#   - Sends the appropriate reply and only finalizes the lead when the reply
+#     actually left the system.
+#   - Optionally pushes qualified leads to HubSpot after a successful reply.
 class VerdictRouter
-  def initialize(lead:)
-    @lead = lead
+  def initialize(lead:, prior_reasoning: nil)
+    @lead            = lead
+    @prior_reasoning = prior_reasoning
   end
 
   def call
-    website_result = WebsiteAnalyzer.new(@lead.extracted_data["website"]).call
+    snapshot = WebsiteAnalyzer.new(@lead.extracted_data["website"]).call
+    verdict  = FinalVerdict.new(
+      lead:             @lead,
+      website_snapshot: snapshot,
+      prior_reasoning:  @prior_reasoning
+    ).call
 
-    if website_result.legitimate?
-      route_by_thresholds(website_result)
+    if verdict.legitimate?
+      route_by_thresholds(verdict)
     else
-      finalize_as_red_flag(website_result)
+      finalize_as_red_flag(verdict)
     end
   end
 
   private
 
-  def route_by_thresholds(website_result)
+  def route_by_thresholds(verdict)
     if below_any_threshold?
-      finalize_as_forwarded(website_result)
+      attempt_forwarded(verdict)
     else
-      finalize_as_qualified(website_result)
+      attempt_qualified(verdict)
     end
   end
 
@@ -36,37 +45,57 @@ class VerdictRouter
     employees < min_employees || budget_eur < min_budget_eur || hours < min_hours
   end
 
-  def finalize_as_red_flag(website_result)
+  def finalize_as_red_flag(verdict)
     @lead.update!(
       status:  Lead::STATUS_RED_FLAGGED,
       verdict: build_verdict(
-        tier:       Lead::TIER_RED_FLAG,
-        score:      0,
-        reasoning:  website_result.reasoning,
-        next_steps: []
+        tier:            Lead::TIER_RED_FLAG,
+        score:           verdict.score,
+        reasoning:       verdict.reasoning,
+        inconsistencies: verdict.inconsistencies,
+        next_steps:      verdict.next_steps
       )
     )
   end
 
-  def finalize_as_forwarded(website_result)
-    MelissaMailer.new(lead: @lead, ai_content: nil).send_forwarded(partner_email: partner_email)
-    @lead.increment!(:ai_reply_count)
+  def attempt_forwarded(verdict)
+    result = MelissaMailer.new(lead: @lead).send_forwarded(partner_email: partner_email)
 
+    if result.sent?
+      @lead.increment!(:ai_reply_count)
+      @lead.update!(
+        last_reply_status: Lead::REPLY_STATUS_SENT,
+        last_reply_error:  nil,
+        status:            Lead::STATUS_FINALIZED,
+        verdict:           build_verdict(
+          tier:            Lead::TIER_FORWARDED,
+          score:           verdict.score,
+          reasoning:       "Below thresholds — handed off to partner (#{partner_email}). #{verdict.reasoning}",
+          inconsistencies: verdict.inconsistencies,
+          next_steps:      verdict.next_steps + ["Partner (#{partner_email}) will follow up directly."]
+        )
+      )
+    else
+      record_reply_failure(result)
+    end
+  end
+
+  def attempt_qualified(verdict)
+    result = MelissaMailer.new(lead: @lead).send_qualified(scheduling_link: scheduling_link)
+
+    unless result.sent?
+      record_reply_failure(result)
+      return
+    end
+
+    @lead.increment!(:ai_reply_count)
     @lead.update!(
-      status:  Lead::STATUS_FINALIZED,
-      verdict: build_verdict(
-        tier:       Lead::TIER_FORWARDED,
-        score:      50,
-        reasoning:  "Below thresholds — handed off to partner (#{partner_email}). Website check: #{website_result.reasoning}",
-        next_steps: ["Partner (#{partner_email}) will follow up directly."]
-      )
+      last_reply_status: Lead::REPLY_STATUS_SENT,
+      last_reply_error:  nil
     )
-  end
 
-  def finalize_as_qualified(website_result)
-    tier, score = tier_and_score
-    MelissaMailer.new(lead: @lead, ai_content: nil).send_qualified(scheduling_link: scheduling_link)
-    @lead.increment!(:ai_reply_count)
+    tier, threshold_score = tier_and_threshold_score
+    combined_score = combine_scores(threshold_score, verdict.score)
 
     hubspot_contact_id = HubspotSync.new(lead: @lead).call
     @lead.update!(hubspot_contact_id: hubspot_contact_id) if hubspot_contact_id
@@ -74,26 +103,35 @@ class VerdictRouter
     @lead.update!(
       status:  Lead::STATUS_FINALIZED,
       verdict: build_verdict(
-        tier:       tier,
-        score:      score,
-        reasoning:  "Passed all thresholds. Website check: #{website_result.reasoning}",
-        next_steps: ["Introductory call via #{scheduling_link}"]
+        tier:            tier,
+        score:           combined_score,
+        reasoning:       "Passed all thresholds. #{verdict.reasoning}",
+        inconsistencies: verdict.inconsistencies,
+        next_steps:      verdict.next_steps + ["Introductory call via #{scheduling_link}"]
       )
     )
   end
 
-  def build_verdict(tier:, score:, reasoning:, next_steps:)
+  def record_reply_failure(result)
+    @lead.update!(
+      last_reply_status: Lead::REPLY_STATUS_FAILED,
+      last_reply_error:  result.error
+    )
+  end
+
+  def build_verdict(tier:, score:, reasoning:, inconsistencies:, next_steps:)
     {
       "tier"              => tier,
       "score"             => score,
       "extracted_data"    => @lead.extracted_data,
       "data_completeness" => @lead.data_completeness,
       "reasoning"         => reasoning,
-      "next_steps"        => next_steps
+      "inconsistencies"   => Array(inconsistencies).map(&:to_s),
+      "next_steps"        => Array(next_steps).map(&:to_s)
     }
   end
 
-  def tier_and_score
+  def tier_and_threshold_score
     employees  = numeric(@lead.extracted_data["employees"])
     budget_eur = numeric(@lead.extracted_data["budget_eur"])
     hours      = numeric(@lead.extracted_data["hours"])
@@ -113,8 +151,15 @@ class VerdictRouter
     [tier, score]
   end
 
+  # Combine the deterministic threshold score with Claude's confidence score so
+  # a strong-fit-on-paper lead with obvious inconsistencies drops below the hot
+  # tier and vice versa.
+  def combine_scores(threshold_score, ai_score)
+    ((threshold_score + ai_score) / 2.0).round
+  end
+
   def threshold_score(value, floor, ceiling)
-    return 0  if value < floor
+    return 0   if value < floor
     return 100 if value >= ceiling
 
     (60 + ((value - floor).to_f / (ceiling - floor) * 40)).round

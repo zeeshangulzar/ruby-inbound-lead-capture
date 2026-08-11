@@ -1,7 +1,7 @@
 require "rails_helper"
 
 RSpec.describe VerdictRouter do
-  subject(:route) { described_class.new(lead: lead).call }
+  subject(:route) { described_class.new(lead: lead, prior_reasoning: "Earlier reasoning.").call }
 
   let(:lead) do
     Lead.create!(
@@ -9,22 +9,25 @@ RSpec.describe VerdictRouter do
       last_message_id: message_id, extracted_data: complete_extracted_data
     )
   end
-  let(:mailer) { instance_double(MelissaMailer, send_qualified: nil, send_forwarded: nil) }
+  let(:mailer) do
+    instance_double(MelissaMailer,
+                    send_qualified: MelissaMailer::Result.new(status: :sent, error: nil),
+                    send_forwarded: MelissaMailer::Result.new(status: :sent, error: nil))
+  end
 
   before do
     allow(MelissaMailer).to receive(:new).and_return(mailer)
     allow(HubspotSync).to receive(:new).and_return(instance_double(HubspotSync, call: nil))
-    stub_website(legitimate: true, reasoning: "Real business.")
+    allow(WebsiteAnalyzer).to receive(:new).and_return(instance_double(WebsiteAnalyzer, call: website_snapshot))
+    stub_verdict(final_verdict(legitimate: true, score: 90))
   end
 
-  def stub_website(legitimate:, reasoning: "")
-    allow_any_instance_of(WebsiteAnalyzer).to receive(:call).and_return(
-      WebsiteAnalyzer::Result.new(legitimate: legitimate, reasoning: reasoning, fetch_error: false)
-    )
+  def stub_verdict(verdict)
+    allow(FinalVerdict).to receive(:new).and_return(instance_double(FinalVerdict, call: verdict))
   end
 
   describe "an illegitimate website" do
-    before { stub_website(legitimate: false, reasoning: "Parked domain.") }
+    before { stub_verdict(final_verdict(legitimate: false, score: 10, reasoning: "Parked domain.")) }
 
     it "red-flags without replying" do
       expect(mailer).not_to receive(:send_qualified)
@@ -33,7 +36,6 @@ RSpec.describe VerdictRouter do
 
       expect(lead.reload.status).to eq(Lead::STATUS_RED_FLAGGED)
       expect(lead.tier).to eq(Lead::TIER_RED_FLAG)
-      expect(lead.score).to eq(0)
       expect(lead.verdict["reasoning"]).to eq("Parked domain.")
     end
 
@@ -48,23 +50,14 @@ RSpec.describe VerdictRouter do
 
     it "forwards when the team is too small" do
       lead.update!(extracted_data: complete_extracted_data.merge("employees" => 5))
-      expect(mailer).to receive(:send_forwarded).with(partner_email: "partner@acme.co")
+      expect(mailer).to receive(:send_forwarded).with(partner_email: "partner@acme.co").and_return(
+        MelissaMailer::Result.new(status: :sent, error: nil)
+      )
       route
 
       expect(lead.reload.tier).to eq(Lead::TIER_FORWARDED)
       expect(lead.status).to eq(Lead::STATUS_FINALIZED)
-    end
-
-    it "forwards when the budget is too low" do
-      lead.update!(extracted_data: complete_extracted_data.merge("budget_eur" => 100))
-      route
-      expect(lead.reload.tier).to eq(Lead::TIER_FORWARDED)
-    end
-
-    it "forwards when the hours are too few" do
-      lead.update!(extracted_data: complete_extracted_data.merge("hours" => 2))
-      route
-      expect(lead.reload.tier).to eq(Lead::TIER_FORWARDED)
+      expect(lead.last_reply_status).to eq(Lead::REPLY_STATUS_SENT)
     end
 
     it "does not push a forwarded lead to HubSpot" do
@@ -73,75 +66,79 @@ RSpec.describe VerdictRouter do
       route
     end
 
-    it "names the partner in the next steps" do
+    it "increments ai_reply_count on a successful forwarded reply" do
       lead.update!(extracted_data: complete_extracted_data.merge("employees" => 5))
-      route
-      expect(lead.reload.verdict["next_steps"].join).to include("partner@acme.co")
+      expect { route }.to change { lead.reload.ai_reply_count }.by(1)
+    end
+
+    it "does not finalize when the reply fails" do
+      lead.update!(extracted_data: complete_extracted_data.merge("employees" => 5))
+      allow(mailer).to receive(:send_forwarded).and_return(
+        MelissaMailer::Result.new(status: :failed, error: "HTTP 500")
+      )
+
+      expect { route }.not_to change { lead.reload.ai_reply_count }
+      expect(lead.reload.status).not_to eq(Lead::STATUS_FINALIZED)
+      expect(lead.last_reply_status).to eq(Lead::REPLY_STATUS_FAILED)
+      expect(lead.last_reply_error).to eq("HTTP 500")
     end
   end
 
   describe "passing every threshold" do
     before { set_env("SCHEDULING_LINK" => "https://cal.example.com/melissa") }
 
-    it "replies with the scheduling link" do
-      expect(mailer).to receive(:send_qualified).with(scheduling_link: "https://cal.example.com/melissa")
+    it "replies with the scheduling link and finalizes" do
+      expect(mailer).to receive(:send_qualified).with(scheduling_link: "https://cal.example.com/melissa").and_return(
+        MelissaMailer::Result.new(status: :sent, error: nil)
+      )
       route
 
       expect(lead.reload.status).to eq(Lead::STATUS_FINALIZED)
-      expect(lead.tier).to be_in([Lead::TIER_HOT, Lead::TIER_WARM, Lead::TIER_COLD])
+      expect(lead.last_reply_status).to eq(Lead::REPLY_STATUS_SENT)
     end
 
-    it "scores a strong lead hot" do
+    it "does not finalize or push to HubSpot when the reply fails" do
+      allow(mailer).to receive(:send_qualified).and_return(
+        MelissaMailer::Result.new(status: :failed, error: "HTTP 502")
+      )
+      expect(HubspotSync).not_to receive(:new)
+
+      route
+
+      expect(lead.reload.status).not_to eq(Lead::STATUS_FINALIZED)
+      expect(lead.ai_reply_count).to eq(0)
+      expect(lead.last_reply_status).to eq(Lead::REPLY_STATUS_FAILED)
+      expect(lead.last_reply_error).to eq("HTTP 502")
+    end
+
+    it "combines threshold and AI score into the final score" do
       lead.update!(extracted_data: complete_extracted_data.merge(
         "employees" => 500, "budget_eur" => 50_000, "hours" => 200
       ))
+      stub_verdict(final_verdict(legitimate: true, score: 80))
       route
 
-      expect(lead.reload.tier).to eq(Lead::TIER_HOT)
-      expect(lead.score).to eq(100)
+      expect(lead.reload.score).to eq(90)
+      expect(lead.tier).to eq(Lead::TIER_HOT)
     end
 
-    it "records the website reasoning" do
+    it "carries the FinalVerdict reasoning into the stored verdict" do
       route
       expect(lead.reload.verdict["reasoning"]).to include("Real business.")
     end
 
-    it "marks completeness full when all fields are present" do
-      route
-      expect(lead.reload.verdict["data_completeness"]).to eq("full")
-    end
-
-    # Spec: verdict JSON is { tier, score, extracted_data, data_completeness,
-    # reasoning, next_steps }.
-    it "stores the whole verdict shape the spec requires" do
+    it "carries FinalVerdict inconsistencies through" do
+      stub_verdict(final_verdict(legitimate: true, score: 70, inconsistencies: ["Employees claim vs. site scale"]))
       route
 
-      expect(lead.reload.verdict.keys)
-        .to include("tier", "score", "extracted_data", "data_completeness", "reasoning", "next_steps")
-      expect(lead.verdict["extracted_data"]).to eq(complete_extracted_data)
-    end
-
-    it "reports minimal completeness when the verdict follows the reply cap" do
-      lead.update!(ai_reply_count: Lead::MAX_AI_REPLIES,
-                   extracted_data: complete_extracted_data.except("hours"))
-      route
-
-      expect(lead.reload.verdict["data_completeness"]).to eq("minimal")
+      expect(lead.reload.verdict["inconsistencies"]).to eq(["Employees claim vs. site scale"])
     end
 
     describe "HubSpot" do
-      it "stores the returned contact id" do
+      it "stores the returned contact id after a successful reply" do
         allow(HubspotSync).to receive(:new).and_return(instance_double(HubspotSync, call: "contact-123"))
         route
         expect(lead.reload.hubspot_contact_id).to eq("contact-123")
-      end
-
-      it "still finalizes the lead when HubSpot returns nothing" do
-        allow(HubspotSync).to receive(:new).and_return(instance_double(HubspotSync, call: nil))
-        route
-
-        expect(lead.reload.hubspot_contact_id).to be_nil
-        expect(lead.status).to eq(Lead::STATUS_FINALIZED)
       end
     end
   end

@@ -83,16 +83,41 @@ module InboundHelpers
   # A LeadQualifier::Result without touching Anthropic.
   def qualification(overrides = {})
     defaults = {
-      extracted_data: {},
-      reply_subject:  "Re: Interested in your consulting services",
-      reply_text:     "Could you share your budget and team size?\n\nMelissa",
-      reply_html:     "<p>Could you share your budget and team size?</p><p>Melissa</p>",
-      hostile:        false,
-      off_topic:      false,
-      reasoning:      "Partial data supplied.",
-      fallback:       false
+      extracted_data:   {},
+      reply_subject:    "Re: Interested in your consulting services",
+      reply_paragraphs: ["Could you share your budget and team size?"],
+      hostile:          false,
+      off_topic:        false,
+      reasoning:        "Partial data supplied.",
+      fallback:         false
     }
     LeadQualifier::Result.new(**defaults.merge(overrides))
+  end
+
+  # A FinalVerdict::Result without touching Anthropic.
+  def final_verdict(overrides = {})
+    defaults = {
+      legitimate:      true,
+      score:           80,
+      reasoning:       "Real business.",
+      inconsistencies: [],
+      next_steps:      [],
+      fallback:        false
+    }
+    FinalVerdict::Result.new(**defaults.merge(overrides))
+  end
+
+  # A WebsiteAnalyzer::Snapshot without touching the network.
+  def website_snapshot(overrides = {})
+    defaults = {
+      url:         "https://acme.co",
+      title:       "Acme",
+      description: "Consulting",
+      body:        "Real business copy.",
+      fetch_error: nil,
+      fetched?:    true
+    }
+    WebsiteAnalyzer::Snapshot.new(**defaults.merge(overrides))
   end
 
   def complete_extracted_data

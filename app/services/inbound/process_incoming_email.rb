@@ -11,10 +11,12 @@ module Inbound
       lead = find_or_create_lead
 
       # Redelivery of a message we already handled: do nothing, rather than
-      # call the AI again and send the prospect a second reply.
+      # call the AI again and send the prospect a second reply. Idempotency is
+      # also enforced at the DB via unique indexes on inbound_events, but this
+      # guard keeps the fast path cheap.
       if lead.already_processed?(@normalized.message_id)
         Rails.logger.info("[ProcessIncomingEmail] duplicate delivery of #{@normalized.message_id} — skipped")
-        return
+        return :duplicate
       end
 
       lead.update!(
@@ -23,8 +25,8 @@ module Inbound
         last_subject:    @normalized.subject.presence || lead.last_subject
       )
 
-      return if lead.status == Lead::STATUS_FINALIZED
-      return if lead.status == Lead::STATUS_RED_FLAGGED
+      return :already_finalized if lead.status == Lead::STATUS_FINALIZED
+      return :already_red_flagged if lead.status == Lead::STATUS_RED_FLAGGED
 
       qualification = LeadQualifier.new(lead: lead, incoming_body: @normalized.body_text).call
 
@@ -33,33 +35,45 @@ module Inbound
 
       if qualification.hostile?
         finalize_as_red_flag(lead, reasoning: qualification.reasoning)
-        return
+        return :red_flagged
       end
 
-      # The AI was unreachable, so there is nothing to qualify on and no point
-      # running the website check. Send the generic acknowledgement and record
-      # the lead as cold.
       if qualification.fallback?
         record_ai_unavailable(lead, reasoning: qualification.reasoning)
 
         # The cap still applies: it exists to stop an exchange running away, and
-        # an unreachable AI is no reason to keep answering.
+        # an unreachable AI is no reason to keep answering. Only successful
+        # deliveries advance the counter — a failed send does not consume a
+        # reply slot.
         unless lead.reply_cap_reached?
-          MelissaMailer.new(lead: lead, ai_content: qualification).send_follow_up
-          lead.increment!(:ai_reply_count)
+          attempt_follow_up(lead, qualification)
         end
-        return
+        return :ai_unavailable
       end
 
       if lead.ready_for_final_verdict?
-        VerdictRouter.new(lead: lead).call
+        VerdictRouter.new(lead: lead, prior_reasoning: qualification.reasoning).call
+        :final_verdict
       else
-        MelissaMailer.new(lead: lead, ai_content: qualification).send_follow_up
-        lead.increment!(:ai_reply_count)
+        attempt_follow_up(lead, qualification)
+        :followed_up
       end
     end
 
     private
+
+    def attempt_follow_up(lead, qualification)
+      lead.update!(last_reply_status: Lead::REPLY_STATUS_PENDING, last_reply_error: nil)
+
+      result = MelissaMailer.new(lead: lead).send_follow_up(reply_paragraphs: qualification.reply_paragraphs)
+
+      if result.sent?
+        lead.update!(last_reply_status: Lead::REPLY_STATUS_SENT, last_reply_error: nil)
+        lead.increment!(:ai_reply_count)
+      else
+        lead.update!(last_reply_status: Lead::REPLY_STATUS_FAILED, last_reply_error: result.error)
+      end
+    end
 
     def find_or_create_lead
       Lead.find_or_create_by!(thread_id: @normalized.thread_id) do |lead|
@@ -77,10 +91,10 @@ module Inbound
       )
     end
 
-    # The AI being unavailable must not lose the lead: the prospect still gets a
-    # generic acknowledgement, and the lead is recorded as cold so it surfaces
-    # in the UI. Status stays in_conversation, so a later round can qualify it
-    # properly once the AI is reachable again.
+    # The AI being unavailable must not lose the lead: status stays
+    # in_conversation, and a later round can qualify it properly once the AI is
+    # reachable again. The verdict is set to a cold tier so it surfaces in the
+    # UI as a lead we couldn't process yet.
     def record_ai_unavailable(lead, reasoning:)
       lead.update!(verdict: verdict_for(lead, tier: Lead::TIER_COLD, reasoning: reasoning))
     end
@@ -92,6 +106,7 @@ module Inbound
         "extracted_data"    => lead.extracted_data,
         "data_completeness" => lead.data_completeness,
         "reasoning"         => reasoning,
+        "inconsistencies"   => [],
         "next_steps"        => []
       }
     end

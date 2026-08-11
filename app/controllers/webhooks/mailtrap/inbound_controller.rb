@@ -2,14 +2,16 @@ module Webhooks
   module Mailtrap
     # Receives Mailtrap Inbound webhooks.
     #
-    # The request body is an envelope of events, not the email itself, so every
-    # `inbound.message_received` event needs an API fetch before the lead
-    # pipeline can run.
+    # The webhook body is an envelope of events — the sender, subject, and body
+    # are not included and have to be fetched off the Inbound API. To keep the
+    # HTTP response fast (and to survive slow AI / third-party calls without
+    # tripping Mailtrap's retry policy), every valid event is persisted to
+    # `inbound_events` and processed by ProcessInboundEventJob. The controller
+    # only signs off with 200 once the events are safely on disk.
     #
-    # Mailtrap retries any non-2xx response up to 10 times over 24 hours. That
-    # is what we want for a genuine outage, but not for a single message we
-    # cannot process, so per-message failures are logged and swallowed: one bad
-    # message must not force redelivery of the whole batch.
+    # Idempotency is enforced at the database via unique indexes on
+    # `event_id` and `message_id`, so a Mailtrap redelivery (or an out-of-order
+    # duplicate) collapses to a no-op instead of a second AI call and reply.
     #
     # @see https://docs.mailtrap.io/inbound-email/webhooks
     class InboundController < ApplicationController
@@ -24,10 +26,11 @@ module Webhooks
           return head :bad_request
         end
 
-        events = Inbound::EventParser.new(JSON.parse(raw_body)).message_received_events
+        payload = JSON.parse(raw_body)
+        events  = Inbound::EventParser.new(payload).message_received_events
         Rails.logger.info("[MailtrapInbound] #{events.size} message_received event(s)")
 
-        events.each { |event| process_event(event) }
+        events.each { |event| persist_and_enqueue(event) }
 
         head :ok
       rescue JSON::ParserError => e
@@ -37,26 +40,19 @@ module Webhooks
 
       private
 
-      # Deliberately not named `process`: ActionController::Metal#process is the
-      # action-dispatch entry point, and overriding it stops the controller from
-      # running its actions at all.
-      def process_event(event)
-        message    = api_client.fetch_message(inbox_id: event.inbox_id, message_id: event.message_id)
-        normalized = Inbound::MessageNormalizer.new(message).call
+      def persist_and_enqueue(event)
+        event_id = event.event_id.presence || "msg-#{event.message_id}"
 
-        if Inbound::AutoResponderFilter.new(normalized).skip?
-          Rails.logger.info("[MailtrapInbound] skipped #{event.message_id} — auto-responder / no-reply sender")
-          return
-        end
-
-        Inbound::ProcessIncomingEmail.new(normalized).call
-      rescue StandardError => e
-        Rails.logger.error("[MailtrapInbound] message #{event.message_id} failed: #{e.class} — #{e.message}")
-        Rails.logger.error(e.backtrace.first(10).join("\n"))
-      end
-
-      def api_client
-        @api_client ||= Inbound::ApiClient.new
+        record = InboundEvent.create!(
+          event_id:   event_id,
+          message_id: event.message_id,
+          inbox_id:   event.inbox_id,
+          status:     InboundEvent::STATUS_QUEUED,
+          payload:    { "event_id" => event_id, "inbox_id" => event.inbox_id, "message_id" => event.message_id }
+        )
+        ProcessInboundEventJob.perform_later(record.id)
+      rescue ActiveRecord::RecordNotUnique, ActiveRecord::RecordInvalid => e
+        Rails.logger.info("[MailtrapInbound] duplicate event/message ignored (#{event.event_id} / #{event.message_id}): #{e.class}")
       end
     end
   end

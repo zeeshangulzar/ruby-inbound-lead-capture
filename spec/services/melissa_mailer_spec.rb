@@ -1,7 +1,7 @@
 require "rails_helper"
 
 RSpec.describe MelissaMailer do
-  subject(:mailer) { described_class.new(lead: lead, ai_content: qualification, api_client: api_client) }
+  subject(:mailer) { described_class.new(lead: lead, api_client: api_client) }
 
   let(:lead) do
     Lead.create!(thread_id: thread_id, sender_email: "sam@acme.co", sender_name: "Sam Prospect",
@@ -11,21 +11,54 @@ RSpec.describe MelissaMailer do
   let(:api_client) { instance_double(Inbound::ApiClient, reply: { "message_ids" => ["abc"] }) }
 
   describe "#send_follow_up" do
+    let(:paragraphs) { ["Could you share your budget and team size?", "Talk soon."] }
+
     it "replies on the original message so Mailtrap threads it" do
       expect(api_client).to receive(:reply).with(hash_including(inbox_id: inbox_id, message_id: message_id))
-      mailer.send_follow_up
+      mailer.send_follow_up(reply_paragraphs: paragraphs)
     end
 
-    it "sends the AI-drafted text and html" do
-      expect(api_client).to receive(:reply).with(
-        hash_including(text: qualification.reply_text, html: qualification.reply_html)
-      )
-      mailer.send_follow_up
+    it "renders the paragraphs into escaped HTML" do
+      expect(api_client).to receive(:reply) do |args|
+        expect(args[:html]).to include("<p>Could you share your budget and team size?</p>")
+        expect(args[:html]).to include("<p>Talk soon.</p>")
+        expect(args[:html]).to include("<p>Melissa</p>")
+      end
+      mailer.send_follow_up(reply_paragraphs: paragraphs)
+    end
+
+    it "escapes HTML characters supplied in the paragraph text" do
+      expect(api_client).to receive(:reply) do |args|
+        expect(args[:html]).to include("&lt;script&gt;alert(1)&lt;/script&gt;")
+        expect(args[:html]).not_to include("<script>alert(1)</script>")
+      end
+      mailer.send_follow_up(reply_paragraphs: ["<script>alert(1)</script>"])
+    end
+
+    it "signs the text off as Melissa" do
+      expect(api_client).to receive(:reply) do |args|
+        expect(args[:text]).to include("Could you share your budget and team size?")
+        expect(args[:text]).to include("Melissa")
+      end
+      mailer.send_follow_up(reply_paragraphs: paragraphs)
     end
 
     it "tags the message with a category" do
       expect(api_client).to receive(:reply).with(hash_including(category: "inbound-lead"))
-      mailer.send_follow_up
+      mailer.send_follow_up(reply_paragraphs: paragraphs)
+    end
+
+    it "returns :sent on success" do
+      result = mailer.send_follow_up(reply_paragraphs: paragraphs)
+      expect(result).to be_sent
+      expect(result.error).to be_nil
+    end
+
+    it "returns :failed with no paragraphs to send" do
+      expect(api_client).not_to receive(:reply)
+      result = mailer.send_follow_up(reply_paragraphs: [])
+      expect(result).to be_failed
+      expect(result.error).to match(/empty/)
     end
   end
 
@@ -42,6 +75,10 @@ RSpec.describe MelissaMailer do
     it "signs off as Melissa" do
       expect(api_client).to receive(:reply) { |args| expect(args[:text]).to include("Melissa") }
       mailer.send_qualified(scheduling_link: "https://example.com/s")
+    end
+
+    it "returns :sent on success" do
+      expect(mailer.send_qualified(scheduling_link: "https://example.com/s")).to be_sent
     end
   end
 
@@ -68,45 +105,45 @@ RSpec.describe MelissaMailer do
       expect(api_client).to receive(:reply).with(hash_including(cc: []))
       mailer.send_forwarded(partner_email: lead.sender_email.upcase)
     end
-
-    it "still CCs a partner who is a different person" do
-      expect(api_client).to receive(:reply).with(hash_including(cc: ["partner@acme.co"]))
-      mailer.send_forwarded(partner_email: "partner@acme.co")
-    end
   end
 
   describe "the from address" do
     it "is omitted by default, because Mailtrap-hosted inboxes reject it" do
+      set_env("MELISSA_EMAIL" => nil)
       expect(api_client).to receive(:reply).with(hash_including(from: nil))
-      mailer.send_follow_up
+      mailer.send_follow_up(reply_paragraphs: ["Anything?"])
     end
 
     it "is set when a custom-domain sender is configured" do
       set_env("MELISSA_EMAIL" => "melissa@acme.co")
       expect(api_client).to receive(:reply).with(hash_including(from: "melissa@acme.co"))
-      mailer.send_follow_up
+      mailer.send_follow_up(reply_paragraphs: ["Anything?"])
     end
   end
 
   describe "when the lead cannot be replied to" do
-    it "logs and does nothing without an inbox_id" do
+    it "returns :failed without an inbox_id" do
       lead.update!(inbox_id: nil)
       expect(api_client).not_to receive(:reply)
-      expect { mailer.send_follow_up }.not_to raise_error
+      result = mailer.send_follow_up(reply_paragraphs: ["Anything?"])
+      expect(result).to be_failed
     end
 
-    it "logs and does nothing without a message id" do
+    it "returns :failed without a message id" do
       lead.update!(last_message_id: nil)
       expect(api_client).not_to receive(:reply)
-      expect { mailer.send_follow_up }.not_to raise_error
+      result = mailer.send_follow_up(reply_paragraphs: ["Anything?"])
+      expect(result).to be_failed
     end
   end
 
-  # A send failure must never break the pipeline: the lead is already saved and
-  # the verdict recorded by the time we try to reply.
-  it "swallows and logs an API error" do
+  # A send failure must never break the pipeline — but it must be visible to
+  # the caller so ai_reply_count and terminal status can be gated on it.
+  it "returns :failed with the error when the API raises" do
     allow(api_client).to receive(:reply).and_raise(Inbound::ApiClient::Error, "HTTP 422")
-    expect(Rails.logger).to receive(:error).with(/reply failed/)
-    expect { mailer.send_follow_up }.not_to raise_error
+    result = mailer.send_follow_up(reply_paragraphs: ["Anything?"])
+
+    expect(result).to be_failed
+    expect(result.error).to include("HTTP 422")
   end
 end

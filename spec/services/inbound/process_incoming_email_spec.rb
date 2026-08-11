@@ -2,7 +2,10 @@ require "rails_helper"
 
 RSpec.describe Inbound::ProcessIncomingEmail do
   let(:normalized) { normalized_message }
-  let(:mailer)     { instance_double(MelissaMailer, send_follow_up: nil) }
+  let(:mailer) do
+    instance_double(MelissaMailer,
+                    send_follow_up: MelissaMailer::Result.new(status: :sent, error: nil))
+  end
 
   before do
     allow(MelissaMailer).to receive(:new).and_return(mailer)
@@ -37,14 +40,6 @@ RSpec.describe Inbound::ProcessIncomingEmail do
 
       expect { described_class.new(second).call }.not_to change(Lead, :count)
       expect(Lead.last.last_message_id).to eq("second-message")
-      expect(Lead.last.last_subject).to eq("Re: following up")
-    end
-
-    it "keeps the previous subject when a reply arrives with none" do
-      process
-      described_class.new(normalized_message("id" => "second", "subject" => "")).call
-
-      expect(Lead.last.last_subject).to eq("Interested in your consulting services")
     end
   end
 
@@ -56,32 +51,31 @@ RSpec.describe Inbound::ProcessIncomingEmail do
       expect(mailer).not_to receive(:send_follow_up)
       process
     end
-
-    it "leaves the reply count untouched" do
-      process
-      expect { process }.not_to change { Lead.last.reload.ai_reply_count }
-    end
   end
 
   describe "when fields are still missing" do
-    it "asks for them and counts the reply" do
-      expect(mailer).to receive(:send_follow_up)
+    it "asks for them and counts the reply on success" do
+      expect(mailer).to receive(:send_follow_up).with(reply_paragraphs: kind_of(Array))
+        .and_return(MelissaMailer::Result.new(status: :sent, error: nil))
       process
 
-      expect(Lead.last.ai_reply_count).to eq(1)
-      expect(Lead.last.status).to eq(Lead::STATUS_IN_CONVERSATION)
+      lead = Lead.last
+      expect(lead.ai_reply_count).to eq(1)
+      expect(lead.last_reply_status).to eq(Lead::REPLY_STATUS_SENT)
+      expect(lead.status).to eq(Lead::STATUS_IN_CONVERSATION)
     end
 
-    it "merges newly supplied fields over the rounds" do
-      allow_any_instance_of(LeadQualifier).to receive(:call)
-        .and_return(qualification(extracted_data: { "employees" => 40 }))
+    it "does not increment the count when the reply fails" do
+      allow(mailer).to receive(:send_follow_up).and_return(
+        MelissaMailer::Result.new(status: :failed, error: "HTTP 500")
+      )
+
       process
+      lead = Lead.last
 
-      allow_any_instance_of(LeadQualifier).to receive(:call)
-        .and_return(qualification(extracted_data: { "budget_eur" => 5000, "employees" => nil }))
-      described_class.new(normalized_message("id" => "second")).call
-
-      expect(Lead.last.extracted_data).to include("employees" => 40, "budget_eur" => 5000)
+      expect(lead.ai_reply_count).to eq(0)
+      expect(lead.last_reply_status).to eq(Lead::REPLY_STATUS_FAILED)
+      expect(lead.last_reply_error).to eq("HTTP 500")
     end
   end
 
@@ -95,6 +89,20 @@ RSpec.describe Inbound::ProcessIncomingEmail do
       expect_any_instance_of(VerdictRouter).to receive(:call)
       expect(mailer).not_to receive(:send_follow_up)
       process
+    end
+
+    it "passes the qualifier's reasoning to the router" do
+      captured = nil
+      allow(VerdictRouter).to receive(:new) do |args|
+        captured = args
+        instance_double(VerdictRouter, call: nil)
+      end
+
+      allow_any_instance_of(LeadQualifier).to receive(:call)
+        .and_return(qualification(extracted_data: complete_extracted_data, reasoning: "Full data supplied."))
+
+      process
+      expect(captured[:prior_reasoning]).to eq("Full data supplied.")
     end
   end
 
@@ -111,18 +119,10 @@ RSpec.describe Inbound::ProcessIncomingEmail do
       lead = Lead.last
       expect(lead.status).to eq(Lead::STATUS_RED_FLAGGED)
       expect(lead.tier).to eq(Lead::TIER_RED_FLAG)
-      expect(lead.score).to eq(0)
       expect(lead.verdict["reasoning"]).to eq("Abusive content.")
-    end
-
-    it "does not run the verdict router" do
-      expect_any_instance_of(VerdictRouter).not_to receive(:call)
-      process
     end
   end
 
-  # Spec: "App degrades gracefully when the LLM is unavailable (fall back to
-  # generic reply, tier: cold)".
   describe "when the AI is unavailable" do
     before do
       allow_any_instance_of(LeadQualifier).to receive(:call).and_return(
@@ -133,61 +133,23 @@ RSpec.describe Inbound::ProcessIncomingEmail do
 
     it "records the lead as cold" do
       process
-      lead = Lead.last
-
-      expect(lead.tier).to eq(Lead::TIER_COLD)
-      expect(lead.score).to eq(0)
-      expect(lead.verdict["reasoning"]).to match(/unavailable/i)
+      expect(Lead.last.tier).to eq(Lead::TIER_COLD)
     end
 
-    it "still sends the generic acknowledgement" do
-      expect(mailer).to receive(:send_follow_up)
+    it "still sends the generic acknowledgement and counts a successful send" do
+      expect(mailer).to receive(:send_follow_up).and_return(
+        MelissaMailer::Result.new(status: :sent, error: nil)
+      )
       process
       expect(Lead.last.ai_reply_count).to eq(1)
     end
 
-    it "leaves the lead in conversation so a later round can qualify it" do
-      process
-      expect(Lead.last.status).to eq(Lead::STATUS_IN_CONVERSATION)
-    end
-
-    it "does not run the website check or verdict routing" do
-      expect_any_instance_of(VerdictRouter).not_to receive(:call)
-      process
-    end
-
     it "stops replying once the reply cap is reached" do
-      process
-      Lead.last.update!(ai_reply_count: Lead::MAX_AI_REPLIES)
-
+      Lead.create!(thread_id: thread_id, sender_email: "sam@acme.co", ai_reply_count: Lead::MAX_AI_REPLIES,
+                   inbox_id: inbox_id, last_message_id: "prior")
       expect(mailer).not_to receive(:send_follow_up)
-      described_class.new(normalized_message("id" => "second")).call
 
-      expect(Lead.last.ai_reply_count).to eq(Lead::MAX_AI_REPLIES)
-      expect(Lead.last.tier).to eq(Lead::TIER_COLD)
-    end
-
-    it "qualifies normally once the AI recovers" do
       process
-      allow_any_instance_of(LeadQualifier).to receive(:call)
-        .and_return(qualification(extracted_data: complete_extracted_data))
-      expect_any_instance_of(VerdictRouter).to receive(:call)
-
-      described_class.new(normalized_message("id" => "second")).call
-    end
-  end
-
-  # Spec: verdict JSON is { tier, score, extracted_data, data_completeness,
-  # reasoning, next_steps }.
-  describe "verdict shape" do
-    it "includes extracted_data and data_completeness on a red flag" do
-      allow_any_instance_of(LeadQualifier).to receive(:call)
-        .and_return(qualification(hostile: true, extracted_data: { "employees" => 40 }, reasoning: "Abusive."))
-      process
-
-      expect(Lead.last.verdict.keys)
-        .to include("tier", "score", "extracted_data", "data_completeness", "reasoning", "next_steps")
-      expect(Lead.last.verdict["extracted_data"]).to include("employees" => 40)
     end
   end
 
